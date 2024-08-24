@@ -1,138 +1,361 @@
-import NextAuth from "next-auth"
-import "next-auth/jwt"
+import { PrismaAdapter } from "@next-auth/prisma-adapter";
+import prisma from "@openqlabs/drm-db";
+import { NextApiRequest, type GetServerSidePropsContext } from "next";
+import {
+  getServerSession,
+  type DefaultSession,
+  type NextAuthOptions,
+} from "next-auth";
+import DiscordProvider from "next-auth/providers/discord";
+import GithubProvider from "next-auth/providers/github";
+import LinkedinProvider from "next-auth/providers/linkedin";
 
-import Apple from "next-auth/providers/apple"
-import Auth0 from "next-auth/providers/auth0"
-import AzureB2C from "next-auth/providers/azure-ad-b2c"
-import BankIDNorway from "next-auth/providers/bankid-no"
-import BoxyHQSAML from "next-auth/providers/boxyhq-saml"
-import Cognito from "next-auth/providers/cognito"
-import Coinbase from "next-auth/providers/coinbase"
-import Discord from "next-auth/providers/discord"
-import Dropbox from "next-auth/providers/dropbox"
-import Facebook from "next-auth/providers/facebook"
-import GitHub from "next-auth/providers/github"
-import GitLab from "next-auth/providers/gitlab"
-import Google from "next-auth/providers/google"
-import Hubspot from "next-auth/providers/hubspot"
-import Keycloak from "next-auth/providers/keycloak"
-import LinkedIn from "next-auth/providers/linkedin"
-import Netlify from "next-auth/providers/netlify"
-import Okta from "next-auth/providers/okta"
-import Passage from "next-auth/providers/passage"
-import Passkey from "next-auth/providers/passkey"
-import Pinterest from "next-auth/providers/pinterest"
-import Reddit from "next-auth/providers/reddit"
-import Slack from "next-auth/providers/slack"
-import Spotify from "next-auth/providers/spotify"
-import Twitch from "next-auth/providers/twitch"
-import Twitter from "next-auth/providers/twitter"
-import WorkOS from "next-auth/providers/workos"
-import Zoom from "next-auth/providers/zoom"
-import { createStorage } from "unstorage"
-import memoryDriver from "unstorage/drivers/memory"
-import vercelKVDriver from "unstorage/drivers/vercel-kv"
-import { UnstorageAdapter } from "@auth/unstorage-adapter"
-import type { NextAuthConfig } from "next-auth"
+import { env } from "~/env.mjs";
+/**
+ * Module augmentation for `next-auth` types. Allows us to add custom properties to the `session`
+ * object and keep type safety.
+ *
+ * @see https://next-auth.js.org/getting-started/typescript#module-augmentation
+ */
+declare module "next-auth" {
+  interface Session extends DefaultSession {
+    user: {
+      id: string;
+    } & DefaultSession["user"];
+    accessToken: string;
+  }
+}
+/**
+ * Options for NextAuth.js used to configure adapters, providers, callbacks, etc.
+ *
+ * @see https://next-auth.js.org/configuration/options
+ */
+export const authOptions = (): NextAuthOptions => {
+  return {
+    logger: {
+      async error(code, metadata) {
+        await prisma.nextAuthLog.create({
+          data: {
+            code,
+            metadata: JSON.stringify(metadata),
+            type: "error",
+          },
+        });
+        console.error(code, metadata);
+      },
+      async warn(code) {
+        await prisma.nextAuthLog.create({
+          data: {
+            code,
+            type: "warn",
+          },
+        });
+        console.warn(code);
+      },
+      async debug(code, metadata) {
+        await prisma.nextAuthLog.create({
+          data: {
+            code,
+            metadata: JSON.stringify(metadata),
+            type: "debug",
+          },
+        });
+        console.debug(code, metadata);
+      },
+    },
 
-const storage = createStorage({
-  driver: process.env.VERCEL
-    ? vercelKVDriver({
-        url: process.env.AUTH_KV_REST_API_URL,
-        token: process.env.AUTH_KV_REST_API_TOKEN,
-        env: false,
-      })
-    : memoryDriver(),
-})
+    debug: true,
+    callbacks: {
+      async session({ session, user }) {
+        console.debug(session, user);
+        try {
+          const account = await prisma.account.findFirst({
+            where: {
+              userId: user.id,
+            },
+          });
 
-const config = {
-  theme: { logo: "https://authjs.dev/img/logo-sm.png" },
-  adapter: UnstorageAdapter(storage),
-  providers: [
-    Apple,
-    Auth0,
-    AzureB2C({
-      clientId: process.env.AUTH_AZURE_AD_B2C_ID,
-      clientSecret: process.env.AUTH_AZURE_AD_B2C_SECRET,
-      issuer: process.env.AUTH_AZURE_AD_B2C_ISSUER,
-    }),
-    BankIDNorway,
-    BoxyHQSAML({
-      clientId: "dummy",
-      clientSecret: "dummy",
-      issuer: process.env.AUTH_BOXYHQ_SAML_ISSUER,
-    }),
-    Cognito,
-    Coinbase,
-    Discord,
-    Dropbox,
-    Facebook,
-    GitHub,
-    GitLab,
-    Google,
-    Hubspot,
-    Keycloak({ name: "Keycloak (bob/bob)" }),
-    LinkedIn,
-    Netlify,
-    Okta,
-    Passkey({
-      formFields: {
-        email: {
-          label: "Username",
-          required: true,
-          autocomplete: "username webauthn",
+          if (!account?.access_token) {
+            throw new Error("No access token found for user");
+          }
+
+          session.accessToken = account.access_token;
+
+          // Check if GitHub token has expired
+          if (account.tokenDead) {
+            // Clear the session to log the user out
+            return {} as DefaultSession;
+          }
+
+          return session;
+        } catch (err) {
+          return session;
+          console.error(err, "error in session callback");
+        }
+      },
+      async signIn({ account, user }) {
+        console.debug(account, user);
+        try {
+          const identifier = user.email
+            ? { email: user.email }
+            : { id: user.id, email: "" };
+          if (user && account) {
+            const userConnection = {
+              user: {
+                connectOrCreate: {
+                  where: { email: user.email as string },
+                  create: {
+                    ...identifier,
+                    name: user.name as string,
+                    firstName: "",
+                    lastName: "",
+                    lastSeen: new Date(),
+                    image: user.image as string,
+                  },
+                },
+              },
+            };
+            const result = await prisma.account.upsert({
+              where: {
+                provider_providerAccountId: {
+                  provider: account.provider,
+                  providerAccountId: account.providerAccountId,
+                },
+              },
+              create: {
+                provider: account.provider,
+                providerAccountId: account.providerAccountId,
+                ...userConnection,
+                access_token: account.access_token,
+                type: account.type,
+                token_type: account.token_type,
+                scope: account.scope,
+              },
+              update: {
+                access_token: account.access_token,
+                tokenDead: false,
+              },
+              include: { user: true },
+            });
+            if (account?.provider === "discord") {
+              const currentUser = await prisma.user.findUnique({
+                where: {
+                  id: result.user.id,
+                },
+                include: {
+                  teamAccounts: true,
+                },
+              });
+              const guild = account.guild as { id: string; name: string };
+              delete account.guild;
+              if (currentUser === null) return true;
+              await prisma.discordGuildTarget.upsert({
+                where: {
+                  id: guild?.id,
+                },
+                create: {
+                  id: guild.id,
+                  name: guild.name,
+                  teamAccounts: {
+                    connect: currentUser?.teamAccounts.map(({ id }) => ({
+                      id,
+                    })),
+                  },
+                },
+                update: {
+                  name: guild.name,
+                  teamAccounts: {
+                    connect: currentUser?.teamAccounts.map(({ id }) => ({
+                      id,
+                    })),
+                  },
+                },
+              });
+            }
+
+            return true;
+          }
+          return true;
+        } catch (err) {
+          console.error(err, "error in sign in callback");
+          return false;
+        }
+      },
+    },
+    adapter: PrismaAdapter(prisma),
+    providers: [
+      GithubProvider({
+        clientId: env.NEXTAUTH_GITHUB_CLIENT_ID,
+        clientSecret: env.NEXTAUTH_GITHUB_CLIENT_SECRET,
+        allowDangerousEmailAccountLinking: true,
+        authorization: {
+          params: {
+            scope: "public_repo user:email read:user",
+          },
+        },
+      }),
+      // accepts max 5 scopes
+      DiscordProvider({
+        clientId: env.NEXTAUTH_DISCORD_CLIENT_ID,
+        clientSecret: env.NEXTAUTH_DISCORD_CLIENT_SECRET,
+        allowDangerousEmailAccountLinking: true,
+        authorization: {
+          params: {
+            scope: "bot identify guilds.join guilds connections",
+          },
+        },
+      }),
+      LinkedinProvider({
+        clientId: env.NEXTAUTH_LINKEDIN_CLIENT_ID,
+        clientSecret: env.NEXTAUTH_LINKEDIN_CLIENT_SECRET,
+        authorization: {
+          params: { scope: "profile email openid r_organization_social" },
+        },
+        allowDangerousEmailAccountLinking: true,
+        idToken: true,
+        issuer: "https://www.linkedin.com/oauth",
+        jwks_endpoint: "https://www.linkedin.com/oauth/openid/jwks",
+        async profile(profile) {
+          return {
+            id: profile.sub,
+            name: profile.name,
+            firstname: profile.given_name,
+            lastname: profile.family_name,
+            email: profile.email,
+          };
+        },
+      }),
+      //474|aiPJhNriix9cInHaZLokwsUfmdwWMcSzGUss8wvi824974b7 = socialData api key
+      /*
+    SlackProvider({
+      clientId: env.NEXTAUTH_SLACK_CLIENT_ID,
+      clientSecret: env.NEXTAUTH_SLACK_CLIENT_SECRET,
+      authorization: {
+        url: "https://slack.com/oauth/v2/authorize",
+        params: {
+          scope:
+            "channels:manage,channels:read,channels:join,chat:write,chat:write.customize,chat:write.public,commands,files:write,im:write,mpim:write,team:read,users.profile:read,users:read,users:read.email,workflow.steps:execute",
+          user_scope:
+            "channels:history,channels:read,channels:write,chat:write,emoji:read,files:read,files:write,groups:history,groups:read,groups:write,im:write,mpim:write,reactions:read,reminders:write,search:read,stars:read,team:read,users.profile:write,users:read,users:read.email",
+          granular_bot_scope: 1,
+          single_channel: 0,
+          redirect_uri: "https://drmdev.openq.dev/api/auth/callback/slack",
         },
       },
-    }),
-    Passage,
-    Pinterest,
-    Reddit,
-    Slack,
-    Spotify,
-    Twitch,
-    Twitter,
-    WorkOS({
-      connection: process.env.AUTH_WORKOS_CONNECTION!,
-    }),
-    Zoom,
-  ],
-  basePath: "/auth",
-  callbacks: {
-    authorized({ request, auth }) {
-      const { pathname } = request.nextUrl
-      if (pathname === "/middleware-example") return !!auth
-      return true
-    },
-    jwt({ token, trigger, session, account }) {
-      if (trigger === "update") token.name = session.user.name
-      if (account?.provider === "keycloak") {
-        return { ...token, accessToken: account.access_token }
-      }
-      return token
-    },
-    async session({ session, token }) {
-      if (token?.accessToken) {
-        session.accessToken = token.accessToken
-      }
-      return session
-    },
-  },
-  experimental: {
-    enableWebAuthn: true,
-  },
-  debug: process.env.NODE_ENV !== "production" ? true : false,
-} satisfies NextAuthConfig
+      token: "https://slack.com/api/oauth.v2.access",
+      userinfo: "https://slack.com/api/users.identity",
+      profile(profile) {
+        console.log(profile);
+        return profile;
+      },
+    }),*/
+      {
+        type: "oauth",
+        id: "slack",
+        name: "Slack",
+        allowDangerousEmailAccountLinking: true,
+        clientId: env.NEXTAUTH_SLACK_CLIENT_ID,
+        clientSecret: env.NEXTAUTH_SLACK_CLIENT_ID,
+        authorization: {
+          url: "https://slack.com/oauth/v2/authorize",
+          params: {
+            scope: "channels:read",
+            user_scope:
+              "channels:history,channels:read,channels:write,chat:write,emoji:read,files:read,files:write,groups:history,groups:read,groups:write,im:write,mpim:write,reactions:read,reminders:write,search:read,stars:read,team:read,users.profile:read,users.profile:write,users:read,users:read.email",
+            granular_bot_scope: 1,
+            single_channel: 0,
+            redirect_uri: "https://drmdev.openq.dev/api/auth/callback/slack",
+          },
+        },
+        token: {
+          url: "https://slack.com/api/oauth.v2.access",
+          async request(context) {
+            const response = await fetch(
+              (context.provider.token as { url: string })?.url,
+              {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded",
+                },
+                body: new URLSearchParams({
+                  client_id: env.NEXTAUTH_SLACK_CLIENT_ID,
+                  client_secret: env.NEXTAUTH_SLACK_CLIENT_SECRET,
+                  code: context.params.code as string,
+                  redirect_uri:
+                    "https://drmdev.openq.dev/api/auth/callback/slack",
+                }),
+              }
+            );
+            const result = await response.json();
+            return {
+              tokens: {
+                access_token: result.authed_user.access_token,
+                refresh_token: result.authed_user.refresh_token,
+                id_token: result.authed_user.id_token,
+              },
+            };
+          },
+        },
 
-export const { handlers, auth, signIn, signOut } = NextAuth(config)
+        userinfo: {
+          url: "https://slack.com/api/auth.test",
+          async request(context) {
+            const { tokens } = context;
+            const response = await fetch(
+              (context.provider.userinfo as { url: string })?.url,
+              {
+                headers: {
+                  Authorization: `Bearer ${tokens.access_token}`,
+                },
+              }
+            );
+            const user = await response.json();
+            // context contains useful properties to help you make the request.
+            return { name: user.user, id: user.user_id, tokens } as {
+              id: string;
+              name: string;
+              tokens: { access_token: string; refresh_token: string };
+            };
+          },
+        },
 
-declare module "next-auth" {
-  interface Session {
-    accessToken?: string
-  }
-}
+        async profile(profile) {
+          const { id, tokens } = profile;
+          const response = await fetch(
+            `https://slack.com/api/users.info?user=${id}`,
+            {
+              headers: {
+                Authorization: `Bearer ${tokens.access_token}`,
+              },
+            }
+          );
+          const result = await response.json();
+          return { ...result.user.profile, ...result.user };
+        },
+      },
+    ],
+    /**
+     * ...add more providers here.
+     *
+     * Most other providers require a bit more work than the Discord provider. For example, the
+     * GitHub provider requires you to add the `refresh_token_expires_in` field to the Account
+     * model. Refer to the NextAuth.js docs for the provider you want to use. Example:
+     *
+     * @see https://next-auth.js.org/providers/github
+     */
+  };
 
-declare module "next-auth/jwt" {
-  interface JWT {
-    accessToken?: string
-  }
-}
+  /**
+   * Wrapper for `getServerSession` so that you don't need to import the `authOptions` in every file.
+   *
+   * @see https://next-auth.js.org/configuration/nextjs
+   */
+};
+
+export const getServerAuthSession = (ctx: {
+  req: NextApiRequest;
+  res: GetServerSidePropsContext["res"];
+}) => {
+  const auth = authOptions();
+  return getServerSession(ctx.req, ctx.res, auth);
+};
